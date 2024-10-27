@@ -16,7 +16,7 @@ public class BoardState
     //public ChessPiece[] squares = new ChessPiece[boardSize * boardSize];
 
     public ChessPlayer[] players = new ChessPlayer[playerCount];
-    bool kingCheck = false;
+    List<PieceMovement> history = new();
     public BoardState()
     {
         for (int i = 0; i < playerCount; i++)
@@ -47,7 +47,7 @@ public class BoardState
     }
     public BoardState Clone()
     {
-        BoardState b = new BoardState();
+        BoardState b = new() { };
         for (int i = 0; i < playerCount; i++)
         {
             foreach (ChessPiece p in players[i].pieces)
@@ -64,26 +64,75 @@ public class BoardState
     {
         return squares.TryGetValue(p.position, out ChessPiece pieceAtDeathLocation) && pieceAtDeathLocation == p;
     }
+    public PieceMovement GetCastleMovement(PieceMovement p)
+    {
+        int direction = Math.Sign(p.to.x - p.from.x);
+        Vector2Int initialRookPosition = new(direction > 0 ? 7 : 0, p.to.y);
+        Vector2Int finalRookPosition = new(p.to.x - direction, p.to.y);
+        return new PieceMovement() { from = initialRookPosition, to = finalRookPosition };
+    }
     public void MovePieces(PieceMovement p)
     {
-        if (squares.TryGetValue(p.from, out ChessPiece piece))
+        ChessPiece piece = squares[p.from];
+        squares.Remove(p.from);
+        if (p.pieceKilled != null)
         {
-            squares.Remove(p.from);
-            if (squares.TryGetValue(p.to, out ChessPiece pieceToKill))
-            {
-                pieceToKill.owner.pieces.Remove(pieceToKill);
-                pieceToKill.owner.deadPieces.Add(pieceToKill);
-            }
-            squares[p.to] = piece;
-            piece.position = p.to;
-            if (piece.type == ChessPieceType.Pawn && p.to.y == piece.owner.TransformY(7))
-            {
-                //reached the end of the board, transform to queen
-                piece.type = ChessPieceType.Queen;
-            }
+            p.pieceKilled.owner.pieces.Remove(p.pieceKilled);
+            p.pieceKilled.owner.deadPieces.Add(p.pieceKilled);
+        }
+        squares[p.to] = piece;
+        piece.position = p.to;
+        if (p.promoted)
+        {
+            piece.type = ChessPieceType.Queen;
+        }
+        else if (p.castling)
+        {
+            MovePieces(GetCastleMovement(p));
         }
     }
+    public void RevertMove(PieceMovement movement)
+    {
+        ChessPiece piece = squares[movement.to];
+        squares.Remove(movement.to);
+        if (movement.pieceKilled != null)
+        {
+            movement.pieceKilled.owner.deadPieces.Remove(movement.pieceKilled);
+            movement.pieceKilled.owner.pieces.Add(movement.pieceKilled);
+            squares.Add(movement.pieceKilled.position, movement.pieceKilled);
+        }
+        squares[movement.from] = piece;
+        piece.position = movement.from;
+        if (movement.promoted)
+        {
+            piece.type = ChessPieceType.Pawn;
+        }
+        else if (movement.castling)
+        {
+            RevertMove(GetCastleMovement(movement));
+        }
+    }
+
     public List<PieceMovement> GetPieceOptions(ChessPiece piece)
+    {
+        List<PieceMovement> options = GetPieceOptionsFast(piece);
+        for (int i = options.Count - 1; i >= 0; i--)
+        {
+            //we can't make illegal moves
+            if (CanKillKing(options[i]))
+            {
+                options.RemoveAt(i);
+            }
+        }
+        return options;
+    }
+
+    /// <summary>
+    /// this function doesn't check if the king is protected!
+    /// </summary>
+    /// <param name="piece"></param>
+    /// <returns></returns>
+    public List<PieceMovement> GetPieceOptionsFast(ChessPiece piece)
     {
         //for each piece, get the places it can go to
 
@@ -95,9 +144,16 @@ public class BoardState
             {
                 if (squares.TryGetValue(pos, out ChessPiece occupyingPiece) && (cantSlay || occupyingPiece.owner == piece.owner))
                     return false;
-                if(!shouldSlay || occupyingPiece != null)
+                if (!shouldSlay || occupyingPiece != null)
                 {
-                    options.Add(new PieceMovement { from = piece.position, to = pos });
+                    options.Add(new PieceMovement
+                    {
+                        from = piece.position,
+                        to = pos,
+                        pieceKilled = occupyingPiece,
+                        //reached the end of the board, transform to queen
+                        promoted = (piece.type == ChessPieceType.Pawn) && (pos.y == piece.owner.TransformY(7))
+                    });
                     return true;
                 }
 
@@ -112,9 +168,11 @@ public class BoardState
                     int direction = piece.owner.id == 1 ? -1 : 1;
                     //either slay diagonally or walk forward
                     int stepCount = (piece.owner.id == 1 ? piece.position.y == 6 : piece.position.y == 1) ? 2 : 1;
+                    Vector2Int checkPos = piece.position;
                     for (int i = 1; i <= stepCount; i++)
                     {
-                        checkOption(piece.position + new Vector2Int(0, direction * i), true);
+                        checkPos.y += direction;
+                        if (!checkOption(checkPos, true)) break;
                     }
 
                     checkOption(piece.position + new Vector2Int(1, direction), false, true);
@@ -127,7 +185,7 @@ public class BoardState
                 {
                     //(1, 2), (2, 1), (2, -1), (1, -2)
 
-                    Vector2Int off = new Vector2Int(1, 2);
+                    Vector2Int off = new(1, 2);
                     if (i % 2 >= 1)
                     {
                         //swap
@@ -191,10 +249,72 @@ public class BoardState
                         }
 
                     }
+                    if (piece.type == ChessPieceType.King)
+                    {
+                        int startY = piece.owner.TransformY(0);
+                        //we might be able to switch with a rook
+                        //that only works if the king and rook are at their original position and nothing is between
+                        if (piece.position.x == 4 && piece.position.y == startY)
+                        {
+                            //check for both rooks
+                            for (int rookX = 0; rookX <= 7; rookX += 7)
+                            {
+                                if (squares.TryGetValue(new Vector2Int(rookX, startY), out ChessPiece rook) && rook.type == ChessPieceType.Rook)
+                                {
+                                    bool between = false;
+                                    step = Math.Sign(rookX - piece.position.x);
+                                    //check if all squares between are empty
+                                    for (int checkX = piece.position.x + step; checkX != rookX; checkX += step)
+                                    {
+                                        if (squares.ContainsKey(new Vector2Int(checkX, startY)))
+                                        {
+                                            //something is here
+                                            between = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!between)
+                                    {
+                                        options.Add(new PieceMovement { from = piece.position, to = new Vector2Int(piece.position.x + step * 2, startY), castling = true });
+                                    }
+                                }
+                            }
+                        }
+                    }
                     break;
                 }
         }
         return options;
-
+    }
+    public List<PieceMovement> GetAllPossibleMoves(ChessPlayer player)
+    {
+        List<PieceMovement> moves = new List<PieceMovement>();
+        foreach (ChessPiece piece in player.pieces)
+        {
+            moves.AddRange(GetPieceOptionsFast(piece));
+        }
+        return moves;
+    }
+    /// <summary>
+    /// checks if the other player can kill the king when a certain move is made. when true, the move can't be executed.
+    /// </summary>
+    /// <param name="movement"></param>
+    /// <returns></returns>
+    public bool CanKillKing(PieceMovement movement)
+    {
+        ChessPlayer player = squares[movement.from].owner;
+        MovePieces(movement);
+        List<PieceMovement> moves = GetAllPossibleMoves(players[1 - player.id]);
+        bool canKill = false;
+        foreach (PieceMovement m in moves)
+        {
+            if (m.pieceKilled?.type == ChessPieceType.King)
+            {
+                canKill = true;
+                break;
+            }
+        }
+        RevertMove(movement);
+        return canKill;
     }
 }
